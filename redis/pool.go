@@ -16,7 +16,6 @@ package redis
 
 import (
 	"bytes"
-	"container/list"
 	"crypto/rand"
 	"crypto/sha1"
 	"errors"
@@ -152,17 +151,59 @@ type Pool struct {
 
 	// mu protects fields defined below.
 	mu     sync.Mutex
-	cond   *sync.Cond
 	closed bool
 	active int
+	notify chan struct{}
 
-	// Stack of idleConn with most recently used at the front.
-	idle list.List
+	idle idleList
+}
+
+type idleList struct {
+	count       int
+	front, back *idleConn
 }
 
 type idleConn struct {
-	c Conn
-	t time.Time
+	c          Conn
+	t          time.Time
+	next, prev *idleConn
+}
+
+func (l *idleList) pushFront(ic *idleConn) {
+	ic.next = l.front
+	ic.prev = nil
+	if l.count == 0 {
+		l.back = ic
+	} else {
+		l.front.prev = ic
+	}
+	l.front = ic
+	l.count++
+	return
+}
+
+func (l *idleList) popFront() {
+	ic := l.front
+	l.count--
+	if l.count == 0 {
+		l.front, l.back = nil, nil
+	} else {
+		ic.next.prev = nil
+		l.front = ic.next
+	}
+	ic.next, ic.prev = nil, nil
+}
+
+func (l *idleList) popBack() {
+	ic := l.back
+	l.count--
+	if l.count == 0 {
+		l.front, l.back = nil, nil
+	} else {
+		ic.prev.next = nil
+		l.back = ic.prev
+	}
+	ic.next, ic.prev = nil, nil
 }
 
 // NewPool creates a new pool.
@@ -198,7 +239,7 @@ func (p *Pool) Stats() PoolStats {
 	p.mu.Lock()
 	stats := PoolStats{
 		ActiveCount: p.active,
-		IdleCount:   p.idle.Len(),
+		IdleCount:   p.idle.count,
 	}
 	p.mu.Unlock()
 
@@ -216,7 +257,7 @@ func (p *Pool) ActiveCount() int {
 // IdleCount returns the number of idle connections in the pool.
 func (p *Pool) IdleCount() int {
 	p.mu.Lock()
-	idle := p.idle.Len()
+	idle := p.idle.count
 	p.mu.Unlock()
 	return idle
 }
@@ -224,26 +265,28 @@ func (p *Pool) IdleCount() int {
 // Close releases the resources used by the pool.
 func (p *Pool) Close() error {
 	p.mu.Lock()
-	idle := p.idle
-	p.idle.Init()
 	p.closed = true
-	p.active -= idle.Len()
-	if p.cond != nil {
-		p.cond.Broadcast()
+	p.active -= p.idle.count
+	ic := p.idle.front
+	p.idle.front, p.idle.back = nil, nil
+	p.idle.count = 0
+	if p.notify != nil {
+		close(p.notify)
+		p.notify = nil
 	}
 	p.mu.Unlock()
-	for e := idle.Front(); e != nil; e = e.Next() {
-		e.Value.(idleConn).c.Close()
+	for ; ic != nil; ic = ic.next {
+		ic.c.Close()
 	}
 	return nil
 }
 
-// release decrements the active count and signals waiters. The caller must
-// hold p.mu during the call.
-func (p *Pool) release() {
-	p.active -= 1
-	if p.cond != nil {
-		p.cond.Signal()
+func (p *Pool) notifyWaiting() {
+	if p.notify != nil {
+		select {
+		case p.notify <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -253,64 +296,56 @@ func (p *Pool) get() (Conn, error) {
 	p.mu.Lock()
 
 	// Prune stale connections.
-
 	if timeout := p.IdleTimeout; timeout > 0 {
-		for i, n := 0, p.idle.Len(); i < n; i++ {
-			e := p.idle.Back()
-			if e == nil {
+		for i, n := 0, p.idle.count; i < n; i++ {
+			ic := p.idle.back
+			if ic == nil {
 				break
 			}
-			ic := e.Value.(idleConn)
 			if ic.t.Add(timeout).After(nowFunc()) {
 				break
 			}
-			p.idle.Remove(e)
-			p.release()
+			p.idle.popBack()
 			p.mu.Unlock()
 			ic.c.Close()
 			p.mu.Lock()
+			p.active--
+			p.notifyWaiting()
 		}
 	}
 
 	for {
 		// Get idle connection.
-
-		for i, n := 0, p.idle.Len(); i < n; i++ {
-			e := p.idle.Front()
-			if e == nil {
-				break
-			}
-			ic := e.Value.(idleConn)
-			p.idle.Remove(e)
-			test := p.TestOnBorrow
+		for p.idle.front != nil {
+			ic := p.idle.front
+			p.idle.popFront()
 			p.mu.Unlock()
-			if test == nil || test(ic.c, ic.t) == nil {
+			if p.TestOnBorrow == nil || p.TestOnBorrow(ic.c, ic.t) == nil {
 				return ic.c, nil
 			}
 			ic.c.Close()
 			p.mu.Lock()
-			p.release()
+			p.active--
+			p.notifyWaiting()
 		}
 
 		// Check for pool closed before dialing a new connection.
-
 		if p.closed {
 			p.mu.Unlock()
 			return nil, errors.New("redigo: get on closed pool")
 		}
 
 		// Dial new connection if under limit.
-
 		if p.MaxActive == 0 || p.active < p.MaxActive {
-			dial := p.Dial
-			p.active += 1
+			p.active++
 			p.mu.Unlock()
-			c, err := dial()
+			c, err := p.Dial()
 			if err != nil {
-				p.mu.Lock()
-				p.release()
-				p.mu.Unlock()
 				c = nil
+				p.mu.Lock()
+				p.active--
+				p.notifyWaiting()
+				p.mu.Unlock()
 			}
 			return c, err
 		}
@@ -320,10 +355,13 @@ func (p *Pool) get() (Conn, error) {
 			return nil, ErrPoolExhausted
 		}
 
-		if p.cond == nil {
-			p.cond = sync.NewCond(&p.mu)
+		if p.notify == nil {
+			p.notify = make(chan struct{}, 1)
 		}
-		p.cond.Wait()
+		notify := p.notify
+		p.mu.Unlock()
+		<-notify
+		p.mu.Lock()
 	}
 }
 
@@ -331,25 +369,23 @@ func (p *Pool) put(c Conn, forceClose bool) error {
 	err := c.Err()
 	p.mu.Lock()
 	if !p.closed && err == nil && !forceClose {
-		p.idle.PushFront(idleConn{t: nowFunc(), c: c})
-		if p.idle.Len() > p.MaxIdle {
-			c = p.idle.Remove(p.idle.Back()).(idleConn).c
+		p.idle.pushFront(&idleConn{t: nowFunc(), c: c})
+		if p.idle.count > p.MaxIdle {
+			c = p.idle.back.c
+			p.idle.popBack()
 		} else {
 			c = nil
 		}
 	}
 
-	if c == nil {
-		if p.cond != nil {
-			p.cond.Signal()
-		}
-		p.mu.Unlock()
-		return nil
+	if c != nil {
+		p.active--
+		c.Close()
 	}
 
-	p.release()
+	p.notifyWaiting()
 	p.mu.Unlock()
-	return c.Close()
+	return nil
 }
 
 type pooledConnection struct {
